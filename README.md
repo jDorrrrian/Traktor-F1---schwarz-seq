@@ -1,6 +1,6 @@
-# Traktor Kontrol F1 Drum Sequencer
+# WIP: Traktor Kontrol F1 Drum Sequencer
 
-Python **MIDI Remote Script** for Ableton Live — no Max for Live required.
+Python **MIDI Remote Script** for Ableton Live — no Max for Live required. Inspired by the Henrik Schwartz m4l sequencer as shown in his masterclasses. Stil WIP.
 
 The F1 becomes a 4-channel, 16-step drum sequencer that writes patterns into Live clip slots. The **active row is whatever scene is selected in Ableton** — change the scene in Live and you get a fresh row of four clips to sequence. The F1 feels like a standalone sequencer sitting on top of the set.
 
