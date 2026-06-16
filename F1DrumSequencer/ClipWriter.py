@@ -47,12 +47,47 @@ class ClipWriter(object):
     def working_scene_index(self):
         return self._working_scene_index
 
-    def _resolve_scene_index(self, scene_index=None):
+    def _resolve_scene_index(self, channel, scene_index=None):
         if scene_index is not None:
             return scene_index
+        playing = self.playing_scene_index(channel)
+        if playing is not None:
+            return playing
         if self._working_scene_index is not None:
             return self._working_scene_index
         return self.scene_index()
+
+    def active_scene_index(self, channel):
+        """Scene row used for pots, pads, and display on this channel."""
+        return self._resolve_scene_index(channel)
+
+    def playing_scene_index(self, channel):
+        """Scene row of the clip currently playing or triggered on this track."""
+        track = self._track(channel)
+        if track is None:
+            return None
+        try:
+            for scene_i, slot in enumerate(track.clip_slots):
+                if not slot.has_clip:
+                    continue
+                try:
+                    if slot.is_playing or slot.is_triggered:
+                        return scene_i
+                except (RuntimeError, AttributeError):
+                    try:
+                        if slot.is_triggered:
+                            return scene_i
+                    except (RuntimeError, AttributeError):
+                        pass
+        except (RuntimeError, AttributeError):
+            pass
+        return None
+
+    def get_playing_clip(self, channel):
+        scene = self.playing_scene_index(channel)
+        if scene is None:
+            return None
+        return self.get_clip(channel, scene)
 
     def _track(self, channel):
         track_index = self._first_track_index + channel
@@ -65,7 +100,7 @@ class ClipWriter(object):
         track = self._track(channel)
         if track is None:
             return None
-        scene_index = self._resolve_scene_index(scene_index)
+        scene_index = self._resolve_scene_index(channel, scene_index)
         if scene_index is None or scene_index >= len(track.clip_slots):
             return None
         return track.clip_slots[scene_index]
@@ -95,7 +130,7 @@ class ClipWriter(object):
                 slot.fire()
                 self._log(
                     "F1 created + fired clip ch=%d scene=%d"
-                    % (channel + 1, self._resolve_scene_index(scene_index) + 1)
+                    % (channel + 1, self._resolve_scene_index(channel, scene_index) + 1)
                 )
             except (RuntimeError, AttributeError) as exc:
                 self._log("F1 create_clip failed ch=%d: %s" % (channel + 1, exc))
@@ -271,6 +306,28 @@ class ClipWriter(object):
 
     # ------------------------------------------------------------ misc
 
+    def fire_clip_if_present(self, channel, scene_index):
+        """Start a clip only if the slot already has one (never create)."""
+        slot = self._slot(channel, scene_index)
+        if slot is None or not slot.has_clip:
+            return False
+        try:
+            slot.fire()
+            self._log(
+                "F1 clip fire ch=%d scene=%d" % (channel + 1, scene_index + 1)
+            )
+            return True
+        except (RuntimeError, AttributeError) as exc:
+            self._log("F1 clip fire failed: %s" % exc)
+            return False
+
+    def adopt_scene(self, scene_index):
+        """Set fallback scene row when nothing is playing (never fires clips)."""
+        if scene_index is None:
+            return
+        self.set_working_scene_index(scene_index)
+        self._log("F1 working scene %d" % (scene_index + 1))
+
     def clip_slot(self, channel, scene_index):
         return self._slot(channel, scene_index)
 
@@ -318,7 +375,7 @@ class ClipWriter(object):
         track.mixer_device.volume.value = max(0.0, min(Config.VOLUME_0DB_NORM, normalized))
 
     def playing_step(self, channel):
-        clip = self.get_clip(channel)
+        clip = self.get_playing_clip(channel)
         if clip is None or not clip.is_playing:
             return -1
         position = clip.playing_position - clip.loop_start

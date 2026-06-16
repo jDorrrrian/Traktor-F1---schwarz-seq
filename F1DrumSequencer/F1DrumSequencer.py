@@ -34,6 +34,7 @@ class F1DrumSequencer(ControlSurface):
         self._browse_held = False
         self._device_mode = 0
         self._clip_launch_row_offset = 0
+        self._last_active_scene = [None] * Config.NUM_CHANNELS
 
         self._suggested_input_port = "Traktor Kontrol F1"
         self._suggested_output_port = "Traktor Kontrol F1"
@@ -652,11 +653,12 @@ class F1DrumSequencer(ControlSurface):
             self._refresh_all_leds(force=True)
 
         self.log_message(
-            "F1 pot ch=%d -> window %d/%d%s"
+            "F1 pot ch=%d -> window %d/%d scene=%d%s"
             % (
                 channel + 1,
                 zone + 1,
                 window_count,
+                self._clip_writer.active_scene_index(channel) + 1,
                 "" if moved else " (no clip yet)",
             )
         )
@@ -664,6 +666,22 @@ class F1DrumSequencer(ControlSurface):
     def _on_selected_scene(self):
         if self._is_clip_launch_mode():
             self._refresh_all_leds(force=True)
+            return
+
+        if not self._is_sequencer_mode():
+            return
+
+        new_scene = self._clip_writer.scene_index()
+        if new_scene is None:
+            return
+
+        if new_scene == self._clip_writer.working_scene_index():
+            return
+
+        self._clip_writer.adopt_scene(new_scene)
+        self._reload_grid()
+        self._refresh_all_leds(force=True)
+        self.log_message("F1 scene row -> %d" % (new_scene + 1))
 
     # ------------------------------------------------------------ playhead
 
@@ -675,7 +693,14 @@ class F1DrumSequencer(ControlSurface):
         if not self._is_sequencer_mode():
             return
 
-        step = self._clip_writer.playing_step(self._sequencer.selected_channel)
+        channel = self._sequencer.selected_channel
+        active_scene = self._clip_writer.active_scene_index(channel)
+        if active_scene != self._last_active_scene[channel]:
+            self._last_active_scene[channel] = active_scene
+            self._reload_grid()
+            self._refresh_all_leds(force=True)
+
+        step = self._clip_writer.playing_step(channel)
         if step == self._sequencer.current_play_step:
             return
         previous = self._sequencer.current_play_step
@@ -702,13 +727,15 @@ class F1DrumSequencer(ControlSurface):
     # ------------------------------------------------------------ state
 
     def _scene_number(self):
-        index = self._clip_writer.working_scene_index()
-        if index is None:
-            index = self._clip_writer.scene_index()
+        channel = self._sequencer.selected_channel
+        index = self._clip_writer.active_scene_index(channel)
         return (index + 1) if index is not None else 0
 
     def _reload_grid(self):
         channel = self._sequencer.selected_channel
+        self._last_active_scene[channel] = self._clip_writer.active_scene_index(
+            channel
+        )
         self._sequencer.window_index[channel] = self._clip_writer.current_window(
             channel
         )
