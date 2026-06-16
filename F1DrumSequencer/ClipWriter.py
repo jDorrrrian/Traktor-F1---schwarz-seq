@@ -14,6 +14,8 @@ class ClipWriter(object):
         self._first_track_index = (
             first_track_index if first_track_index is not None else Config.FIRST_TRACK_INDEX
         )
+        # When set, sequencer read/write uses this row instead of Live's selection.
+        self._working_scene_index = None
 
     def set_first_track_index(self, index):
         self._first_track_index = index
@@ -38,6 +40,20 @@ class ClipWriter(object):
             pass
         return None
 
+    def set_working_scene_index(self, scene_index):
+        """Lock sequencer I/O to a scene row (standalone from Live's selection)."""
+        self._working_scene_index = scene_index
+
+    def working_scene_index(self):
+        return self._working_scene_index
+
+    def _resolve_scene_index(self, scene_index=None):
+        if scene_index is not None:
+            return scene_index
+        if self._working_scene_index is not None:
+            return self._working_scene_index
+        return self.scene_index()
+
     def _track(self, channel):
         track_index = self._first_track_index + channel
         tracks = self._song.tracks
@@ -49,8 +65,7 @@ class ClipWriter(object):
         track = self._track(channel)
         if track is None:
             return None
-        if scene_index is None:
-            scene_index = self.scene_index()
+        scene_index = self._resolve_scene_index(scene_index)
         if scene_index is None or scene_index >= len(track.clip_slots):
             return None
         return track.clip_slots[scene_index]
@@ -77,6 +92,11 @@ class ClipWriter(object):
                 clip.looping = True
                 clip.loop_start = 0.0
                 clip.loop_end = Config.WINDOW_BEATS
+                slot.fire()
+                self._log(
+                    "F1 created + fired clip ch=%d scene=%d"
+                    % (channel + 1, self._resolve_scene_index(scene_index) + 1)
+                )
             except (RuntimeError, AttributeError) as exc:
                 self._log("F1 create_clip failed ch=%d: %s" % (channel + 1, exc))
                 return None
@@ -183,18 +203,44 @@ class ClipWriter(object):
         if specs:
             clip.add_new_notes(tuple(specs))
 
-    def clear_clip(self, channel, scene_index=None):
+    def clear_loop_window(self, channel, scene_index=None):
+        """Remove notes only inside the clip's current loop window."""
         clip = self.get_clip(channel, scene_index)
         if clip is None:
             return
-        clip.remove_notes_extended(
-            0, 128, 0.0, Config.MAX_WINDOWS * Config.WINDOW_BEATS
+        start, _end = self._window_bounds(clip)
+        clip.remove_notes_extended(0, 128, start, Config.WINDOW_BEATS)
+
+    def transpose_clip(self, channel, semitones, scene_index=None):
+        """Shift every note in the clip by semitones (whole-clip sound change)."""
+        if semitones == 0:
+            return
+        clip = self.get_clip(channel, scene_index)
+        if clip is None:
+            return
+
+        length = Config.MAX_WINDOWS * Config.WINDOW_BEATS
+        notes = list(clip.get_notes_extended(0, 128, 0.0, length))
+        if not notes:
+            return
+
+        clip.remove_notes_extended(0, 128, 0.0, length)
+        specs = []
+        for note in notes:
+            specs.append(
+                Live.Clip.MidiNoteSpecification(
+                    pitch=max(0, min(127, int(note.pitch) + semitones)),
+                    start_time=float(note.start_time),
+                    duration=float(note.duration),
+                    velocity=int(note.velocity),
+                    mute=bool(note.mute),
+                )
+            )
+        clip.add_new_notes(tuple(specs))
+        self._log(
+            "F1 transpose ch=%d %+d semitones (%d notes)"
+            % (channel + 1, semitones, len(specs))
         )
-        try:
-            clip.loop_start = 0.0
-            clip.loop_end = Config.WINDOW_BEATS
-        except RuntimeError:
-            pass
 
     def copy_row_from_scene(self, from_scene, to_scene):
         """Copy each channel's loop window pattern from one scene row to another."""
@@ -225,25 +271,51 @@ class ClipWriter(object):
 
     # ------------------------------------------------------------ misc
 
-    def launch_row(self, scene_index=None):
-        if scene_index is None:
-            scene_index = self.scene_index()
-        if scene_index is None:
-            return
+    def clip_slot(self, channel, scene_index):
+        return self._slot(channel, scene_index)
 
-        fired = 0
-        for channel in range(Config.NUM_CHANNELS):
-            slot = self._slot(channel, scene_index)
-            if slot is not None and slot.has_clip:
+    def toggle_clip_slot(self, channel, scene_index):
+        """Fire or stop a session clip slot (APC-style)."""
+        slot = self._slot(channel, scene_index)
+        if slot is None or not slot.has_clip:
+            return False
+
+        try:
+            if slot.is_playing or slot.is_triggered:
+                slot.stop()
+                self._log(
+                    "F1 clip stop ch=%d scene=%d" % (channel + 1, scene_index + 1)
+                )
+            else:
                 slot.fire()
-                fired += 1
-        self._log("F1 launched row scene=%d (%d clips)" % (scene_index + 1, fired))
+                self._log(
+                    "F1 clip fire ch=%d scene=%d" % (channel + 1, scene_index + 1)
+                )
+            return True
+        except (RuntimeError, AttributeError) as exc:
+            self._log("F1 clip toggle failed: %s" % exc)
+            return False
 
-    def set_track_volume(self, channel, normalized):
+    def clip_slot_has_clip(self, channel, scene_index):
+        slot = self._slot(channel, scene_index)
+        return slot is not None and slot.has_clip
+
+    def clip_slot_is_active(self, channel, scene_index):
+        slot = self._slot(channel, scene_index)
+        if slot is None or not slot.has_clip:
+            return False
+        try:
+            return bool(slot.is_playing or slot.is_triggered)
+        except (RuntimeError, AttributeError):
+            return False
+
+    def set_track_volume(self, channel, midi_value):
+        """Map fader CC 0..127 to silence..0 dB (no +6 dB boost)."""
         track = self._track(channel)
         if track is None:
             return
-        track.mixer_device.volume.value = max(0.0, min(1.0, normalized))
+        normalized = (float(midi_value) / 127.0) * Config.VOLUME_0DB_NORM
+        track.mixer_device.volume.value = max(0.0, min(Config.VOLUME_0DB_NORM, normalized))
 
     def playing_step(self, channel):
         clip = self.get_clip(channel)

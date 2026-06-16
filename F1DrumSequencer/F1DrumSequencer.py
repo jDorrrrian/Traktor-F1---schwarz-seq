@@ -33,7 +33,7 @@ class F1DrumSequencer(ControlSurface):
         self._type_held = False
         self._browse_held = False
         self._device_mode = 0
-        self._last_scene_index = None
+        self._clip_launch_row_offset = 0
 
         self._suggested_input_port = "Traktor Kontrol F1"
         self._suggested_output_port = "Traktor Kontrol F1"
@@ -49,7 +49,7 @@ class F1DrumSequencer(ControlSurface):
         song.add_is_playing_listener(self._on_is_playing)
         song.view.add_selected_scene_listener(self._on_selected_scene)
 
-        self._last_scene_index = self._clip_writer.scene_index()
+        self._clip_writer.set_working_scene_index(self._clip_writer.scene_index())
         self._reload_grid()
         self._refresh_all_leds(force=True)
         self._update_mode_display(force=True)
@@ -76,17 +76,29 @@ class F1DrumSequencer(ControlSurface):
         self._led_cache = {}
         if self._is_passthrough_mode():
             self._all_leds_off()
+        elif self._is_clip_launch_mode() or self._is_finger_drum_mode():
+            self._refresh_all_leds(force=True)
         else:
+            self._reload_grid()
             self._refresh_all_leds(force=True)
         self._update_mode_display(force=True)
 
     # ------------------------------------------------------------ modes
 
-    def _is_passthrough_mode(self):
-        return self._device_mode == Config.MODE_PASSTHROUGH_INDEX
+    def _current_mode_config(self):
+        return Config.DEVICE_MODES[self._device_mode]
 
-    def _is_drum_mode(self):
-        return not self._is_passthrough_mode()
+    def _is_passthrough_mode(self):
+        return self._current_mode_config().get("mode") == "passthrough"
+
+    def _is_sequencer_mode(self):
+        return self._current_mode_config().get("mode") == "sequencer"
+
+    def _is_clip_launch_mode(self):
+        return self._current_mode_config().get("mode") == "clip_launch"
+
+    def _is_finger_drum_mode(self):
+        return self._current_mode_config().get("mode") == "finger_drum"
 
     def _cycle_device_mode(self, direction):
         self._set_device_mode(
@@ -98,14 +110,29 @@ class F1DrumSequencer(ControlSurface):
             return
 
         self._device_mode = mode_index
-        mode = Config.DEVICE_MODES[mode_index]
+        mode = self._current_mode_config()
 
-        if mode.get("passthrough"):
+        if mode.get("mode") == "passthrough":
             self._sequencer.current_play_step = -1
             self._all_leds_off()
-        else:
+        elif mode.get("mode") == "sequencer":
             self._clip_writer.set_first_track_index(mode["first_track_index"])
+            if self._clip_writer.working_scene_index() is None:
+                self._clip_writer.set_working_scene_index(
+                    self._clip_writer.scene_index()
+                )
             self._reload_grid()
+            self._refresh_all_leds(force=True)
+        elif mode.get("mode") == "clip_launch":
+            self._clip_launch_row_offset = 0
+            self._sequencer.current_play_step = -1
+            self._clip_writer.set_working_scene_index(None)
+            if "first_track_index" in mode:
+                self._clip_writer.set_first_track_index(mode["first_track_index"])
+            self._refresh_all_leds(force=True)
+        elif mode.get("mode") == "finger_drum":
+            self._sequencer.current_play_step = -1
+            self._sequencer.reset_finger_drum_bank()
             self._refresh_all_leds(force=True)
 
         label = mode["label"]
@@ -329,6 +356,34 @@ class F1DrumSequencer(ControlSurface):
             self._on_pad_press(cc - Config.PAD_CC_START)
             return True
 
+        if self._is_clip_launch_mode() or self._is_finger_drum_mode():
+            if channel == Config.CHANNEL_SELECT_CHANNEL and cc in Config.CHANNEL_SELECT_CCS:
+                self._on_channel_select(Config.CHANNEL_SELECT_CCS.index(cc))
+                return True
+
+            if channel == Config.ENCODER_CHANNEL and cc == Config.ENCODER_TURN_CC:
+                if self._browse_held:
+                    return True
+                if 1 <= value <= 63:
+                    self._on_encoder_turn(1)
+                elif 65 <= value <= 127:
+                    self._on_encoder_turn(-1)
+                return True
+
+            if channel == Config.ENCODER_CHANNEL and cc == Config.ENCODER_PUSH_CC:
+                if self._is_button_pressed(value):
+                    self._on_encoder_push()
+                return True
+
+            if self._is_function_button_cc(channel, cc):
+                return False
+
+            fader_index = self._fader_map.get((channel, cc))
+            if fader_index is not None:
+                self._clip_writer.set_track_volume(fader_index, value)
+                return True
+            return False
+
         if channel == Config.CHANNEL_SELECT_CHANNEL and cc in Config.CHANNEL_SELECT_CCS:
             self._on_channel_select(Config.CHANNEL_SELECT_CCS.index(cc))
             return True
@@ -356,7 +411,7 @@ class F1DrumSequencer(ControlSurface):
 
         fader_index = self._fader_map.get((channel, cc))
         if fader_index is not None:
-            self._clip_writer.set_track_volume(fader_index, value / 127.0)
+            self._clip_writer.set_track_volume(fader_index, value)
             return True
 
         return False
@@ -373,6 +428,13 @@ class F1DrumSequencer(ControlSurface):
         )
 
     def _on_pad_press(self, step):
+        if self._is_clip_launch_mode():
+            self._on_clip_launch_pad(step)
+            return
+        if self._is_finger_drum_mode():
+            self._on_finger_drum_pad(step)
+            return
+
         if self._type_held:
             self._sequencer.toggle_accent(step)
             self._write_selected_channel()
@@ -401,7 +463,67 @@ class F1DrumSequencer(ControlSurface):
             )
         )
 
+    def _clip_launch_scene_index(self, row):
+        base = self._clip_writer.scene_index()
+        if base is None:
+            base = 0
+        return base + self._clip_launch_row_offset + row
+
+    def _on_clip_launch_pad(self, pad):
+        track_channel = pad % Config.CLIP_LAUNCH_TRACKS
+        row = pad // Config.CLIP_LAUNCH_TRACKS
+        scene_index = self._clip_launch_scene_index(row)
+
+        song = self.song()
+        if scene_index < 0 or scene_index >= len(song.scenes):
+            return
+
+        if self._clip_writer.toggle_clip_slot(track_channel, scene_index):
+            self._set_pad_led(pad, force=True)
+
+    def _on_finger_drum_pad(self, pad):
+        pitch = self._sequencer.finger_drum_pitch(pad)
+        self._inject_note(pitch, Config.FINGER_DRUM_VELOCITY)
+        self._sequencer.finger_drum_lit_pad = pad
+        self._set_pad_led(pad, force=True)
+        self.schedule_message(
+            Config.FINGER_DRUM_NOTE_OFF_TICKS,
+            lambda p=pad: self._finger_drum_pad_release(p),
+        )
+        self.log_message("F1 drum pad %d pitch %d bank %d" % (
+            pad + 1,
+            pitch,
+            self._sequencer.finger_drum_bank,
+        ))
+
+    def _finger_drum_pad_release(self, pad):
+        if self._sequencer.finger_drum_lit_pad == pad:
+            self._sequencer.finger_drum_lit_pad = -1
+            self._set_pad_led(pad, force=True)
+
+    def _inject_note(self, pitch, velocity):
+        self._forward_to_live((0x90, pitch, velocity))
+        self.schedule_message(
+            Config.FINGER_DRUM_NOTE_OFF_TICKS,
+            lambda p=pitch: self._forward_to_live((0x80, p, 0)),
+        )
+
+    def _transpose_selected_channel_sound(self, old_pitch, new_pitch):
+        delta = new_pitch - old_pitch
+        if delta == 0:
+            return
+        channel = self._sequencer.selected_channel
+        self._clip_writer.transpose_clip(channel, delta)
+
     def _on_channel_select(self, channel):
+        if self._is_clip_launch_mode() or self._is_finger_drum_mode():
+            if channel == self._sequencer.selected_channel:
+                return
+            self._sequencer.select_channel(channel)
+            self._refresh_all_leds(force=True)
+            self.log_message("F1 highlight track %d" % (channel + 1))
+            return
+
         if channel == self._sequencer.selected_channel:
             return
         self._sequencer.select_channel(channel)
@@ -417,13 +539,39 @@ class F1DrumSequencer(ControlSurface):
         )
 
     def _on_encoder_turn(self, direction):
+        if self._is_finger_drum_mode():
+            self._sequencer.cycle_finger_drum_bank(direction)
+            self._sequencer.clamp_finger_drum_bank()
+            self._refresh_all_leds(force=True)
+            self.log_message(
+                "F1 drum bank %d (low pitch %d)"
+                % (
+                    self._sequencer.finger_drum_bank,
+                    self._sequencer.finger_drum_pitch(0),
+                )
+            )
+            return
+
+        if self._is_clip_launch_mode():
+            self._clip_launch_row_offset = max(
+                0, self._clip_launch_row_offset + direction
+            )
+            self._refresh_all_leds(force=True)
+            self.log_message(
+                "F1 clip rows offset +%d" % self._clip_launch_row_offset
+            )
+            return
+
+        old_pitch = self._sequencer.current_pitch()
         self._sequencer.cycle_sound(direction)
+        new_pitch = self._sequencer.current_pitch()
+        self._transpose_selected_channel_sound(old_pitch, new_pitch)
         self._write_selected_channel()
         self.log_message(
             "F1 sound %d pitch %d (ch %d)"
             % (
                 self._sequencer.sound_index[self._sequencer.selected_channel] + 1,
-                self._sequencer.current_pitch(),
+                new_pitch,
                 self._sequencer.selected_channel + 1,
             )
         )
@@ -436,7 +584,7 @@ class F1DrumSequencer(ControlSurface):
             return
 
         if role == "type":
-            if self._is_button_pressed(value):
+            if self._is_button_pressed(value) and self._is_sequencer_mode():
                 self.log_message("F1 Type held — tap pad for accent")
             return
 
@@ -449,22 +597,44 @@ class F1DrumSequencer(ControlSurface):
             self.log_message("F1 Size (no action assigned)")
 
     def _on_encoder_push(self):
+        if self._is_finger_drum_mode():
+            self._sequencer.reset_finger_drum_bank()
+            self._refresh_all_leds(force=True)
+            self.log_message("F1 drum bank reset (pitch %d)" % (
+                self._sequencer.finger_drum_pitch(0),
+            ))
+            return
+
+        if self._is_clip_launch_mode():
+            self._clip_launch_row_offset = 0
+            self._refresh_all_leds(force=True)
+            self.log_message("F1 clip rows offset reset")
+            return
+
+        old_pitch = self._sequencer.current_pitch()
         self._sequencer.reset_sound()
+        new_pitch = self._sequencer.current_pitch()
+        self._transpose_selected_channel_sound(old_pitch, new_pitch)
         self._write_selected_channel()
         self.log_message(
             "F1 sound reset to 1 (ch %d)" % (self._sequencer.selected_channel + 1)
         )
 
     def _on_clear(self):
+        if not self._is_sequencer_mode():
+            return
+
         channel = self._sequencer.selected_channel
         self._sequencer.clear_pattern()
-        self._clip_writer.clear_clip(channel)
-        self._sequencer.window_index[channel] = 0
-        self._sequencer.pot_zone[channel] = None
+        self._clip_writer.clear_loop_window(channel)
         self._refresh_all_leds(force=True)
         self.log_message(
-            "F1 cleared clip ch=%d scene=%d"
-            % (channel + 1, self._scene_number())
+            "F1 cleared loop ch=%d win=%d scene=%d"
+            % (
+                channel + 1,
+                self._sequencer.window_index[channel] + 1,
+                self._scene_number(),
+            )
         )
 
     def _on_window_pot(self, channel, value):
@@ -492,33 +662,17 @@ class F1DrumSequencer(ControlSurface):
         )
 
     def _on_selected_scene(self):
-        if self._is_passthrough_mode():
-            return
-
-        new_scene = self._clip_writer.scene_index()
-        old_scene = self._last_scene_index
-
-        if (
-            Config.COPY_PATTERN_ON_SCENE_SELECT
-            and old_scene is not None
-            and new_scene is not None
-            and old_scene != new_scene
-        ):
-            self._clip_writer.copy_row_from_scene(old_scene, new_scene)
-
-        self._last_scene_index = new_scene
-        self._reload_grid()
-        self._refresh_all_leds(force=True)
-
-        if Config.LAUNCH_ON_SCENE_SELECT:
-            self._clip_writer.launch_row(new_scene)
-
-        self.log_message("F1 scene -> %d" % self._scene_number())
+        if self._is_clip_launch_mode():
+            self._refresh_all_leds(force=True)
 
     # ------------------------------------------------------------ playhead
 
     def _on_song_time(self):
-        if self._is_passthrough_mode():
+        if self._is_clip_launch_mode():
+            self._refresh_clip_launch_leds()
+            return
+
+        if not self._is_sequencer_mode():
             return
 
         step = self._clip_writer.playing_step(self._sequencer.selected_channel)
@@ -532,7 +686,11 @@ class F1DrumSequencer(ControlSurface):
             self._set_pad_led(step)
 
     def _on_is_playing(self):
-        if self._is_passthrough_mode():
+        if self._is_clip_launch_mode():
+            self._refresh_clip_launch_leds()
+            return
+
+        if not self._is_sequencer_mode():
             return
 
         if not self.song().is_playing:
@@ -544,7 +702,9 @@ class F1DrumSequencer(ControlSurface):
     # ------------------------------------------------------------ state
 
     def _scene_number(self):
-        index = self._clip_writer.scene_index()
+        index = self._clip_writer.working_scene_index()
+        if index is None:
+            index = self._clip_writer.scene_index()
         return (index + 1) if index is not None else 0
 
     def _reload_grid(self):
@@ -557,7 +717,76 @@ class F1DrumSequencer(ControlSurface):
 
     # ------------------------------------------------------------ LEDs
 
+    def _refresh_clip_launch_leds(self):
+        blink = int(self.song().current_song_time) % 2 == 0
+        for pad in range(Config.NUM_STEPS):
+            track_channel = pad % Config.CLIP_LAUNCH_TRACKS
+            row = pad // Config.CLIP_LAUNCH_TRACKS
+            scene_index = self._clip_launch_scene_index(row)
+            has_clip = self._clip_writer.clip_slot_has_clip(
+                track_channel, scene_index
+            )
+            active = self._clip_writer.clip_slot_is_active(
+                track_channel, scene_index
+            )
+            if not has_clip:
+                brightness = Config.LED_OFF
+            elif active:
+                brightness = (
+                    Config.LED_PLAYHEAD_ACTIVE if blink else Config.LED_PLAYHEAD_EMPTY
+                )
+            else:
+                brightness = Config.LED_ACTIVE
+            self._set_clip_launch_pad_led(pad, brightness, force=True)
+
+        for index, cc in enumerate(Config.CHANNEL_SELECT_CCS):
+            value = 127 if index == self._sequencer.selected_channel else 0
+            self._send_cc(Config.CHANNEL_SELECT_CHANNEL, cc, value)
+
+    def _set_clip_launch_pad_led(self, pad, brightness, force=False):
+        if Config.LED_MODE == "hsb":
+            cc = Config.PAD_LED_CCS[pad]
+            hue = Config.CHANNEL_HUES[pad % Config.CLIP_LAUNCH_TRACKS]
+            for led_channel, component in zip(
+                Config.PAD_LED_HSB_CHANNELS,
+                (hue, Config.LED_SATURATION, brightness),
+            ):
+                self._send_cc(led_channel, cc, component, force=force)
+        else:
+            number = Config.LED_PAD_NUMBERS[pad]
+            color = Config.CHANNEL_COLOR_VALUES[pad % Config.CLIP_LAUNCH_TRACKS]
+            value = brightness if brightness > Config.LED_OFF else Config.LED_OFF
+            if brightness == Config.LED_ACTIVE:
+                value = color
+            self._send_led(Config.LED_CHANNEL, number, value, force=force)
+
+    def _set_finger_drum_pad_led(self, pad):
+        if Config.LED_MODE == "hsb":
+            cc = Config.PAD_LED_CCS[pad]
+            hue = Config.CHANNEL_HUES[pad % Config.NUM_CHANNELS]
+            brightness = self._sequencer.finger_drum_pad_led_value(pad)
+            for led_channel, component in zip(
+                Config.PAD_LED_HSB_CHANNELS,
+                (hue, Config.LED_SATURATION, brightness),
+            ):
+                self._send_cc(led_channel, cc, component)
+        else:
+            number = Config.LED_PAD_NUMBERS[pad]
+            value = self._sequencer.finger_drum_pad_led_value(pad)
+            self._send_led(Config.LED_CHANNEL, number, value)
+
     def _refresh_all_leds(self, force=False):
+        if self._is_clip_launch_mode():
+            self._refresh_clip_launch_leds()
+            return
+        if self._is_finger_drum_mode():
+            for step in range(Config.NUM_STEPS):
+                self._set_finger_drum_pad_led(step)
+            for index, cc in enumerate(Config.CHANNEL_SELECT_CCS):
+                value = 127 if index == self._sequencer.selected_channel else 0
+                self._send_cc(Config.CHANNEL_SELECT_CHANNEL, cc, value, force=force)
+            return
+
         for step in range(Config.NUM_STEPS):
             self._set_pad_led(step, force=force)
         for index, cc in enumerate(Config.CHANNEL_SELECT_CCS):
@@ -565,6 +794,12 @@ class F1DrumSequencer(ControlSurface):
             self._send_cc(Config.CHANNEL_SELECT_CHANNEL, cc, value, force=force)
 
     def _set_pad_led(self, step, force=False):
+        if self._is_clip_launch_mode():
+            return
+        if self._is_finger_drum_mode():
+            self._set_finger_drum_pad_led(step)
+            return
+
         if Config.LED_MODE == "hsb":
             cc = Config.PAD_LED_CCS[step]
             hue = Config.CHANNEL_HUES[self._sequencer.selected_channel]

@@ -16,6 +16,8 @@ class SequencerState(object):
         self.steps = [False] * Config.NUM_STEPS
         self.accents = [False] * Config.NUM_STEPS
         self.current_play_step = -1
+        self.finger_drum_bank = 0
+        self.finger_drum_lit_pad = -1
 
     def load_pattern(self, steps, accents, pitch):
         self.steps = list(steps)
@@ -56,6 +58,43 @@ class SequencerState(object):
 
     def reset_sound(self):
         self.sound_index[self.selected_channel] = 0
+
+    def cycle_finger_drum_bank(self, direction):
+        self.finger_drum_bank += direction
+
+    def reset_finger_drum_bank(self):
+        self.finger_drum_bank = 0
+
+    def finger_drum_pitch(self, pad_index):
+        pitch = (
+            Config.FINGER_DRUM_BASE_PITCH
+            + self.finger_drum_bank * Config.FINGER_DRUM_BANK_SIZE
+            + pad_index
+        )
+        return max(
+            Config.FINGER_DRUM_MIN_PITCH,
+            min(Config.FINGER_DRUM_MAX_PITCH, pitch),
+        )
+
+    def finger_drum_bank_clamped(self):
+        """Return bank index so the lowest pad stays within MIDI range."""
+        max_bank = (
+            Config.FINGER_DRUM_MAX_PITCH
+            - Config.FINGER_DRUM_BASE_PITCH
+            - (Config.FINGER_DRUM_BANK_SIZE - 1)
+        ) // Config.FINGER_DRUM_BANK_SIZE
+        min_bank = (
+            Config.FINGER_DRUM_MIN_PITCH - Config.FINGER_DRUM_BASE_PITCH
+        ) // Config.FINGER_DRUM_BANK_SIZE
+        return max(min_bank, min(max_bank, self.finger_drum_bank))
+
+    def clamp_finger_drum_bank(self):
+        self.finger_drum_bank = self.finger_drum_bank_clamped()
+
+    def finger_drum_pad_led_value(self, pad_index):
+        if pad_index == self.finger_drum_lit_pad:
+            return Config.LED_PLAYHEAD_ACTIVE
+        return Config.LED_ACTIVE
 
     def step_is_active(self, step_index):
         return self.steps[step_index]
