@@ -160,6 +160,11 @@ class F1DrumSequencer(ControlSurface):
             force=force,
         )
 
+    def _show_sound_number(self):
+        """Display the selected channel's sound number (1 = C1 ... 16 = D#2)."""
+        channel = self._sequencer.selected_channel
+        self._send_segment(self._sequencer.sound_index[channel] + 1, force=True)
+
     def _forward_to_live(self, midi_bytes):
         """Forward raw MIDI into Live (MIDI map / Remote assignments)."""
         try:
@@ -568,6 +573,7 @@ class F1DrumSequencer(ControlSurface):
         new_pitch = self._sequencer.current_pitch()
         self._transpose_selected_channel_sound(old_pitch, new_pitch)
         self._write_selected_channel()
+        self._show_sound_number()
         self.log_message(
             "F1 sound %d pitch %d (ch %d)"
             % (
@@ -617,6 +623,7 @@ class F1DrumSequencer(ControlSurface):
         new_pitch = self._sequencer.current_pitch()
         self._transpose_selected_channel_sound(old_pitch, new_pitch)
         self._write_selected_channel()
+        self._show_sound_number()
         self.log_message(
             "F1 sound reset to 1 (ch %d)" % (self._sequencer.selected_channel + 1)
         )
@@ -741,6 +748,8 @@ class F1DrumSequencer(ControlSurface):
         )
         steps, accents, pitch = self._clip_writer.read_pattern(channel)
         self._sequencer.load_pattern(steps, accents, pitch)
+        # Switching to/loading another clip updates the sound-number display.
+        self._show_sound_number()
 
     # ------------------------------------------------------------ LEDs
 

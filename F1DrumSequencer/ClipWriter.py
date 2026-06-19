@@ -159,6 +159,16 @@ class ClipWriter(object):
         end = start + Config.WINDOW_BEATS
 
         try:
+            clip.looping = True
+        except (RuntimeError, AttributeError):
+            pass
+
+        # Move start/end markers first so the loop brace and start marker can
+        # always be placed (Live rejects start_marker >= end_marker, which is
+        # why this was inconsistent across clips of different lengths).
+        markers_ok = self._move_clip_markers(clip, start, end)
+
+        try:
             if start >= clip.loop_end:
                 clip.loop_end = end
                 clip.loop_start = start
@@ -173,10 +183,41 @@ class ClipWriter(object):
                 return False
 
         self._log(
-            "F1 loop ch=%d -> window %d (%.0f..%.0f beats)"
-            % (channel + 1, window + 1, start, end)
+            "F1 loop ch=%d -> window %d (%.0f..%.0f beats)%s"
+            % (
+                channel + 1,
+                window + 1,
+                start,
+                end,
+                "" if markers_ok else " (markers not moved)",
+            )
         )
         return True
+
+    def _move_clip_markers(self, clip, start, end):
+        """Place the clip's start/end markers around [start, end] robustly.
+
+        Live forbids start_marker >= end_marker, so we first drop the start
+        marker to 0, then extend the end marker past the window, then set the
+        start marker. MIDI clips can be extended freely, so this works no
+        matter how long the clip originally was. This makes launching the clip
+        begin inside the looped region instead of playing everything before it.
+        """
+        ok = True
+        try:
+            clip.start_marker = 0.0
+        except (RuntimeError, AttributeError):
+            ok = False
+        try:
+            if clip.end_marker < end:
+                clip.end_marker = end
+        except (RuntimeError, AttributeError):
+            ok = False
+        try:
+            clip.start_marker = start
+        except (RuntimeError, AttributeError):
+            ok = False
+        return ok
 
     def _window_bounds(self, clip):
         start = float(clip.loop_start)
