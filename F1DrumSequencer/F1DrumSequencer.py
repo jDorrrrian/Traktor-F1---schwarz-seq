@@ -32,6 +32,12 @@ class F1DrumSequencer(ControlSurface):
         self._fader_map = {}
         self._type_held = False
         self._browse_held = False
+        self._quant_held = False
+        self._size_held = False
+        self._held_channel = None
+        # Becomes True once we observe a pad release (i.e. pads are in Gate mode),
+        # which unlocks hold-to-edit. Increment-mode pads (no release) just toggle.
+        self._mel_gate_pads = False
         self._device_mode = 0
         self._clip_launch_row_offset = 0
         self._last_active_scene = [None] * Config.NUM_CHANNELS
@@ -79,6 +85,9 @@ class F1DrumSequencer(ControlSurface):
             self._all_leds_off()
         elif self._is_clip_launch_mode() or self._is_finger_drum_mode():
             self._refresh_all_leds(force=True)
+        elif self._is_melodic_mode():
+            self._reload_melodic_grid()
+            self._refresh_all_leds(force=True)
         else:
             self._reload_grid()
             self._refresh_all_leds(force=True)
@@ -92,7 +101,7 @@ class F1DrumSequencer(ControlSurface):
     def _is_passthrough_mode(self):
         return self._current_mode_config().get("mode") == "passthrough"
 
-    def _is_sequencer_mode(self):
+    def _is_sequencer_mode(self): 
         return self._current_mode_config().get("mode") == "sequencer"
 
     def _is_clip_launch_mode(self):
@@ -100,6 +109,9 @@ class F1DrumSequencer(ControlSurface):
 
     def _is_finger_drum_mode(self):
         return self._current_mode_config().get("mode") == "finger_drum"
+
+    def _is_melodic_mode(self):
+        return self._current_mode_config().get("mode") == "melodic"
 
     def _cycle_device_mode(self, direction):
         self._set_device_mode(
@@ -111,6 +123,7 @@ class F1DrumSequencer(ControlSurface):
             return
 
         self._device_mode = mode_index
+        self._held_channel = None
         mode = self._current_mode_config()
 
         if mode.get("mode") == "passthrough":
@@ -128,12 +141,26 @@ class F1DrumSequencer(ControlSurface):
             self._clip_launch_row_offset = 0
             self._sequencer.current_play_step = -1
             self._clip_writer.set_working_scene_index(None)
+            self._clip_writer.reset_channel_track_offsets()
             if "first_track_index" in mode:
                 self._clip_writer.set_first_track_index(mode["first_track_index"])
             self._refresh_all_leds(force=True)
         elif mode.get("mode") == "finger_drum":
             self._sequencer.current_play_step = -1
             self._sequencer.reset_finger_drum_bank()
+            self._refresh_all_leds(force=True)
+        elif mode.get("mode") == "melodic":
+            self._clip_writer.reset_channel_track_offsets()
+            self._clip_writer.set_first_track_index(
+                mode.get("first_track_index", Config.MELODIC_FIRST_TRACK_INDEX)
+            )
+            if self._clip_writer.working_scene_index() is None:
+                self._clip_writer.set_working_scene_index(
+                    self._clip_writer.scene_index()
+                )
+            self._sequencer.mel_held_pads.clear()
+            self._sequencer.mel_play_step = -1
+            self._reload_melodic_grid()
             self._refresh_all_leds(force=True)
 
         label = mode["label"]
@@ -206,9 +233,9 @@ class F1DrumSequencer(ControlSurface):
         return value == 0
 
     def _update_modifier_hold_states(self, channel, cc, value):
-        """Track Type / Browse hold before any other handler runs."""
+        """Track Type / Browse / Quant / Size hold before any other handler runs."""
         role = self._function_button_role(channel, cc)
-        if role in ("type", "browse"):
+        if role in ("type", "browse", "quant", "size"):
             self._apply_function_button_modifier(role, value)
 
     def _handle_mode_switch_action(self, channel, cc, value):
@@ -254,15 +281,13 @@ class F1DrumSequencer(ControlSurface):
 
     def _apply_function_button_modifier(self, role, value):
         if role == "type":
-            if self._is_button_released(value):
-                self._type_held = False
-            elif self._is_button_pressed(value):
-                self._type_held = True
+            self._type_held = self._is_button_pressed(value)
         elif role == "browse":
-            if self._is_button_released(value):
-                self._browse_held = False
-            elif self._is_button_pressed(value):
-                self._browse_held = True
+            self._browse_held = self._is_button_pressed(value)
+        elif role == "quant":
+            self._quant_held = self._is_button_pressed(value)
+        elif role == "size":
+            self._size_held = self._is_button_pressed(value)
 
     def _add_slider(self, channel, cc, name):
         element = SliderElement(MIDI_CC_TYPE, channel, cc, name=name)
@@ -288,6 +313,7 @@ class F1DrumSequencer(ControlSurface):
             (Config.TYPE_CC, "Type"),
             (Config.SIZE_CC, "Size"),
             (Config.BROWSE_CC, "Browse"),
+            (Config.QUANT_CC, "Quant"),
         ):
             role = Config.FUNCTION_ROLE_BY_CC[cc]
             self._add_function_button(Config.FUNCTION_CHANNEL, cc, role, name)
@@ -358,13 +384,17 @@ class F1DrumSequencer(ControlSurface):
             )
 
     def _handle_cc(self, channel, cc, value):
+        if self._is_melodic_mode():
+            return self._handle_melodic_cc(channel, cc, value)
+
         if channel == Config.PAD_CHANNEL and Config.PAD_CC_START <= cc <= Config.PAD_CC_END:
             self._on_pad_press(cc - Config.PAD_CC_START)
             return True
 
         if self._is_clip_launch_mode() or self._is_finger_drum_mode():
             if channel == Config.CHANNEL_SELECT_CHANNEL and cc in Config.CHANNEL_SELECT_CCS:
-                self._on_channel_select(Config.CHANNEL_SELECT_CCS.index(cc))
+                if self._is_button_pressed(value):
+                    self._on_channel_select(Config.CHANNEL_SELECT_CCS.index(cc))
                 return True
 
             if channel == Config.ENCODER_CHANNEL and cc == Config.ENCODER_TURN_CC:
@@ -391,7 +421,7 @@ class F1DrumSequencer(ControlSurface):
             return False
 
         if channel == Config.CHANNEL_SELECT_CHANNEL and cc in Config.CHANNEL_SELECT_CCS:
-            self._on_channel_select(Config.CHANNEL_SELECT_CCS.index(cc))
+            self._on_channel_button(Config.CHANNEL_SELECT_CCS.index(cc), value)
             return True
 
         if channel == Config.ENCODER_CHANNEL and cc == Config.ENCODER_TURN_CC:
@@ -514,12 +544,244 @@ class F1DrumSequencer(ControlSurface):
             lambda p=pitch: self._forward_to_live((0x80, p, 0)),
         )
 
+    # ------------------------------------------------------------ melodic
+
+    def _handle_melodic_cc(self, channel, cc, value):
+        if channel == Config.PAD_CHANNEL and Config.PAD_CC_START <= cc <= Config.PAD_CC_END:
+            pad = cc - Config.PAD_CC_START
+            if self._is_button_pressed(value):
+                self._on_melodic_pad_press(pad)
+            else:
+                self._on_melodic_pad_release(pad)
+            return True
+
+        if channel == Config.CHANNEL_SELECT_CHANNEL and cc in Config.CHANNEL_SELECT_CCS:
+            self._on_channel_button(Config.CHANNEL_SELECT_CCS.index(cc), value)
+            return True
+
+        if channel == Config.ENCODER_CHANNEL and cc == Config.ENCODER_TURN_CC:
+            if self._browse_held:
+                return True
+            direction = 1 if 1 <= value <= 63 else (-1 if 65 <= value <= 127 else 0)
+            if direction:
+                self._on_melodic_encoder_turn(direction)
+            return True
+
+        if channel == Config.ENCODER_CHANNEL and cc == Config.ENCODER_PUSH_CC:
+            if self._is_button_pressed(value):
+                self._on_melodic_encoder_push()
+            return True
+
+        # Function buttons reach their element listeners (Clear etc.).
+        if self._is_function_button_cc(channel, cc):
+            return False
+
+        # Filter pots: forward to Live so the user can MIDI-map them.
+        if channel in Config.POT_CHANNELS and cc in Config.POT_CCS:
+            self._forward_to_live((0xB0 | (channel & 0x0F), cc, value))
+            return True
+
+        fader_index = self._fader_map.get((channel, cc))
+        if fader_index is not None:
+            self._on_melodic_fader(fader_index, value)
+            return True
+
+        return False
+
+    def _on_melodic_pad_press(self, pad):
+        s = self._sequencer
+        step = s.mel_global_step(pad)
+        s.mel_last_step = step
+        if self._mel_gate_pads:
+            # Gate pads: tentatively toggle on press. If the user then edits
+            # (encoder/fader) while holding, the toggle is reverted so a hold
+            # only *selects* the step (commit happens on release).
+            s.mel_held_pads.add(step)
+            s.mel_tentative[step] = s.mel_active[step]
+        active = s.mel_toggle_step(step)
+        if active and s.mel_extend_length_for(step):
+            self._clip_writer.set_melodic_length(s.mel_length_steps)
+        self._write_melodic()
+        self._refresh_all_leds(force=True)
+        self.log_message(
+            "F1 melodic step %d %s (page %d, note %d)"
+            % (
+                step + 1,
+                "on" if active else "off",
+                s.mel_page + 1,
+                s.mel_effective_pitch(step),
+            )
+        )
+
+    def _on_melodic_pad_release(self, pad):
+        s = self._sequencer
+        self._mel_gate_pads = True
+        step = s.mel_global_step(pad)
+        s.mel_held_pads.discard(step)
+        s.mel_tentative.pop(step, None)
+        self._refresh_all_leds()
+
+    def _melodic_prepare_edit(self):
+        """A hold-edit must not also toggle: revert any tentative toggles first."""
+        s = self._sequencer
+        reverted = False
+        for step in list(s.mel_held_pads):
+            if step in s.mel_tentative:
+                s.mel_active[step] = s.mel_tentative.pop(step)
+                reverted = True
+        return reverted
+
+    def _on_melodic_page_select(self, page):
+        if not self._sequencer.mel_select_page(page):
+            return
+        self._refresh_all_leds(force=True)
+        self.log_message(
+            "F1 melodic page %d/%d"
+            % (page + 1, self._sequencer.mel_page_count())
+        )
+
+    def _on_melodic_encoder_turn(self, direction):
+        if self._held_channel is not None:
+            self._remap_melodic_track(direction)
+            return
+
+        if self._size_held:
+            length = self._sequencer.mel_change_length_steps(direction)
+            self._clip_writer.set_melodic_length(length)
+            self._write_melodic()
+            self._send_segment(length, force=True)
+            self._refresh_all_leds(force=True)
+            self.log_message("F1 melodic length %d steps" % length)
+            return
+
+        if self._quant_held:
+            key = self._sequencer.mel_change_key(direction)
+            self._send_melodic_key()
+            self._send_segment(key + 1, force=True)
+            self.log_message("F1 melodic key %d" % key)
+            return
+
+        if self._type_held:
+            scale = self._sequencer.mel_change_scale_type(direction)
+            self._send_melodic_scale_type()
+            self._send_segment(scale + 1, force=True)
+            self.log_message("F1 melodic scale type %d" % scale)
+            return
+
+        self._melodic_prepare_edit()
+        targets = self._sequencer.mel_target_steps()
+        if not targets:
+            return
+        for step in targets:
+            self._sequencer.mel_change_pitch(step, direction)
+        self._write_melodic()
+        self._refresh_all_leds()
+        self.log_message(
+            "F1 melodic note -> %d (step %d)"
+            % (self._sequencer.mel_effective_pitch(targets[0]), targets[0] + 1)
+        )
+
+    def _on_melodic_encoder_push(self):
+        self._melodic_prepare_edit()
+        targets = self._sequencer.mel_target_steps()
+        for step in targets:
+            self._sequencer.mel_reset_step(step)
+        if targets:
+            self._write_melodic()
+            self._refresh_all_leds(force=True)
+            self.log_message("F1 melodic step reset (step %d)" % (targets[0] + 1))
+
+    def _on_melodic_fader(self, fader_index, value):
+        self._melodic_prepare_edit()
+        targets = self._sequencer.mel_target_steps()
+        if not targets:
+            return
+        for step in targets:
+            if fader_index == 0:
+                self._sequencer.mel_set_octave_from_fader(step, value)
+            elif fader_index == 1:
+                self._sequencer.mel_set_velocity_from_fader(step, value)
+            elif fader_index == 2:
+                self._sequencer.mel_set_length_from_fader(step, value)
+            elif fader_index == 3:
+                self._sequencer.mel_set_release_from_fader(step, value)
+        self._write_melodic()
+        self._refresh_all_leds()
+
+    def _send_melodic_key(self):
+        value = int(round(
+            self._sequencer.mel_key * 127.0 / max(1, Config.MELODIC_KEY_COUNT - 1)
+        ))
+        self._send_cc(Config.MELODIC_OUT_CHANNEL, Config.MELODIC_KEY_CC, value, force=True)
+
+    def _send_melodic_scale_type(self):
+        value = int(round(
+            self._sequencer.mel_scale_type
+            * 127.0
+            / max(1, Config.MELODIC_SCALE_TYPE_COUNT - 1)
+        ))
+        self._send_cc(
+            Config.MELODIC_OUT_CHANNEL, Config.MELODIC_SCALE_TYPE_CC, value, force=True
+        )
+
+    def _write_melodic(self):
+        self._clip_writer.write_melodic_pattern(self._sequencer)
+
+    def _reload_melodic_grid(self):
+        notes_by_step, length_steps = self._clip_writer.read_melodic_pattern()
+        if notes_by_step is None:
+            return
+        self._sequencer.mel_load(notes_by_step, length_steps)
+
     def _transpose_selected_channel_sound(self, old_pitch, new_pitch):
         delta = new_pitch - old_pitch
         if delta == 0:
             return
         channel = self._sequencer.selected_channel
         self._clip_writer.transpose_clip(channel, delta)
+
+    def _on_channel_button(self, channel, value):
+        """Press selects (drum) / selects page (melodic); while a button is held the
+        encoder remaps the track that button controls (+/- one track per tick).
+
+        With Gate-mode buttons the hold ends on release. As a safety for Increment-
+        mode buttons (no release event), pressing the same button again clears the
+        hold so the encoder can't get stuck remapping."""
+        if self._is_button_pressed(value):
+            if self._held_channel == channel:
+                self._held_channel = None
+                return
+            self._held_channel = channel
+            if self._is_melodic_mode():
+                self._on_melodic_page_select(channel)
+            else:
+                self._on_channel_select(channel)
+        elif self._is_button_released(value):
+            if self._held_channel == channel:
+                self._held_channel = None
+
+    def _remap_channel_track(self, channel, direction):
+        self._clip_writer.set_channel_track_offset(
+            channel, self._clip_writer.channel_track_offset(channel) + direction
+        )
+        track_no = self._clip_writer.track_index_for(channel) + 1
+        self._sequencer.select_channel(channel)
+        self._reload_grid()
+        self._refresh_all_leds(force=True)
+        self._send_segment(track_no, force=True)
+        self.log_message(
+            "F1 channel %d -> track %d" % (channel + 1, track_no)
+        )
+
+    def _remap_melodic_track(self, direction):
+        self._clip_writer.set_channel_track_offset(
+            0, self._clip_writer.channel_track_offset(0) + direction
+        )
+        track_no = self._clip_writer.track_index_for(0) + 1
+        self._reload_melodic_grid()
+        self._refresh_all_leds(force=True)
+        self._send_segment(track_no, force=True)
+        self.log_message("F1 melodic -> track %d" % track_no)
 
     def _on_channel_select(self, channel):
         if self._is_clip_launch_mode() or self._is_finger_drum_mode():
@@ -566,6 +828,10 @@ class F1DrumSequencer(ControlSurface):
             self.log_message(
                 "F1 clip rows offset +%d" % self._clip_launch_row_offset
             )
+            return
+
+        if self._held_channel is not None:
+            self._remap_channel_track(self._held_channel, direction)
             return
 
         old_pitch = self._sequencer.current_pitch()
@@ -629,6 +895,14 @@ class F1DrumSequencer(ControlSurface):
         )
 
     def _on_clear(self):
+        if self._is_melodic_mode():
+            self._sequencer.mel_clear()
+            self._sequencer.mel_held_pads.clear()
+            self._clip_writer.clear_melodic()
+            self._refresh_all_leds(force=True)
+            self.log_message("F1 melodic cleared")
+            return
+
         if not self._is_sequencer_mode():
             return
 
@@ -675,6 +949,16 @@ class F1DrumSequencer(ControlSurface):
             self._refresh_all_leds(force=True)
             return
 
+        if self._is_melodic_mode():
+            new_scene = self._clip_writer.scene_index()
+            if new_scene is None or new_scene == self._clip_writer.working_scene_index():
+                return
+            self._clip_writer.adopt_scene(new_scene)
+            self._reload_melodic_grid()
+            self._refresh_all_leds(force=True)
+            self.log_message("F1 melodic scene row -> %d" % (new_scene + 1))
+            return
+
         if not self._is_sequencer_mode():
             return
 
@@ -695,6 +979,10 @@ class F1DrumSequencer(ControlSurface):
     def _on_song_time(self):
         if self._is_clip_launch_mode():
             self._refresh_clip_launch_leds()
+            return
+
+        if self._is_melodic_mode():
+            self._update_melodic_playhead()
             return
 
         if not self._is_sequencer_mode():
@@ -722,6 +1010,12 @@ class F1DrumSequencer(ControlSurface):
             self._refresh_clip_launch_leds()
             return
 
+        if self._is_melodic_mode():
+            if not self.song().is_playing:
+                self._sequencer.mel_play_step = -1
+                self._refresh_all_leds(force=True)
+            return
+
         if not self._is_sequencer_mode():
             return
 
@@ -730,6 +1024,20 @@ class F1DrumSequencer(ControlSurface):
             self._sequencer.current_play_step = -1
             if 0 <= previous < Config.NUM_STEPS:
                 self._set_pad_led(previous)
+
+    def _update_melodic_playhead(self):
+        step = self._clip_writer.melodic_playing_step()
+        if step == self._sequencer.mel_play_step:
+            return
+        previous = self._sequencer.mel_play_step
+        self._sequencer.mel_play_step = step
+        page_size = Config.MELODIC_STEPS_PER_PAGE
+        page = self._sequencer.mel_page
+        for global_step in (previous, step):
+            if global_step < 0:
+                continue
+            if global_step // page_size == page:
+                self._set_melodic_pad_led(global_step % page_size)
 
     # ------------------------------------------------------------ state
 
@@ -811,9 +1119,45 @@ class F1DrumSequencer(ControlSurface):
             value = self._sequencer.finger_drum_pad_led_value(pad)
             self._send_led(Config.LED_CHANNEL, number, value)
 
+    def _refresh_melodic_leds(self, force=False):
+        for pad in range(Config.MELODIC_STEPS_PER_PAGE):
+            self._set_melodic_pad_led(pad, force=force)
+        # All four page buttons are always available (up to MELODIC_MAX_PAGES);
+        # the current page is brightest, pages that hold steps are mid, rest dim.
+        for index, cc in enumerate(Config.CHANNEL_SELECT_CCS):
+            if index >= Config.MELODIC_MAX_PAGES:
+                value = 0
+            elif index == self._sequencer.mel_page:
+                value = 127
+            elif index < self._sequencer.mel_page_count():
+                value = 40
+            else:
+                value = 8
+            self._send_cc(Config.CHANNEL_SELECT_CHANNEL, cc, value, force=force)
+
+    def _set_melodic_pad_led(self, pad, force=False):
+        if Config.LED_MODE == "hsb":
+            cc = Config.PAD_LED_CCS[pad]
+            hsb = self._sequencer.mel_pad_led_hsb(pad, Config.MELODIC_HUE)
+            for led_channel, value in zip(Config.PAD_LED_HSB_CHANNELS, hsb):
+                self._send_cc(led_channel, cc, value, force=force)
+        else:
+            number = Config.LED_PAD_NUMBERS[pad]
+            step = self._sequencer.mel_global_step(pad)
+            if step == self._sequencer.mel_play_step:
+                value = Config.LED_SINGLE_PLAYHEAD_ACTIVE
+            elif self._sequencer.mel_active[step]:
+                value = Config.CHANNEL_COLOR_VALUES[0]
+            else:
+                value = Config.LED_OFF
+            self._send_led(Config.LED_CHANNEL, number, value, force=force)
+
     def _refresh_all_leds(self, force=False):
         if self._is_clip_launch_mode():
             self._refresh_clip_launch_leds()
+            return
+        if self._is_melodic_mode():
+            self._refresh_melodic_leds(force=force)
             return
         if self._is_finger_drum_mode():
             for step in range(Config.NUM_STEPS):
@@ -831,6 +1175,9 @@ class F1DrumSequencer(ControlSurface):
 
     def _set_pad_led(self, step, force=False):
         if self._is_clip_launch_mode():
+            return
+        if self._is_melodic_mode():
+            self._set_melodic_pad_led(step, force=force)
             return
         if self._is_finger_drum_mode():
             self._set_finger_drum_pad_led(step)

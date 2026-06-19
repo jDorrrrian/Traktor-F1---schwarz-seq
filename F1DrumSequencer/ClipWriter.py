@@ -16,12 +16,36 @@ class ClipWriter(object):
         )
         # When set, sequencer read/write uses this row instead of Live's selection.
         self._working_scene_index = None
+        # Per-channel track override (relative to first_track_index). Default 0,1,2,3
+        # so channel k controls track first_track_index + k. The user can remap each
+        # channel by holding its select button and turning the encoder.
+        self._channel_track_offsets = list(range(Config.NUM_CHANNELS))
 
     def set_first_track_index(self, index):
         self._first_track_index = index
 
     def first_track_index(self):
         return self._first_track_index
+
+    def channel_track_offset(self, channel):
+        if 0 <= channel < len(self._channel_track_offsets):
+            return self._channel_track_offsets[channel]
+        return channel
+
+    def set_channel_track_offset(self, channel, offset):
+        """Clamp so the resulting absolute track index stays valid."""
+        if not (0 <= channel < len(self._channel_track_offsets)):
+            return
+        track_count = len(self._song.tracks)
+        lo = -self._first_track_index
+        hi = track_count - 1 - self._first_track_index
+        self._channel_track_offsets[channel] = max(lo, min(hi, offset))
+
+    def reset_channel_track_offsets(self):
+        self._channel_track_offsets = list(range(Config.NUM_CHANNELS))
+
+    def track_index_for(self, channel):
+        return self._first_track_index + self.channel_track_offset(channel)
 
     def _log(self, message):
         if self._log_fn:
@@ -90,7 +114,7 @@ class ClipWriter(object):
         return self.get_clip(channel, scene)
 
     def _track(self, channel):
-        track_index = self._first_track_index + channel
+        track_index = self.track_index_for(channel)
         tracks = self._song.tracks
         if track_index < 0 or track_index >= len(tracks):
             return None
@@ -317,6 +341,163 @@ class ClipWriter(object):
             "F1 transpose ch=%d %+d semitones (%d notes)"
             % (channel + 1, semitones, len(specs))
         )
+
+    # ------------------------------------------------------------ melodic
+
+    def _melodic_length_beats(self, length_steps):
+        return length_steps * Config.STEP_DURATION_BEATS
+
+    def ensure_melodic_clip(self, length_steps, scene_index=None):
+        slot = self._slot(0, scene_index)
+        if slot is None:
+            self._log(
+                "F1 melodic: no clip slot (track %d, scene %s)"
+                % (self.track_index_for(0) + 1, self._resolve_scene_index(0, scene_index))
+            )
+            return None
+        if not slot.has_clip:
+            try:
+                length = self._melodic_length_beats(length_steps)
+                slot.create_clip(max(length, Config.STEP_DURATION_BEATS))
+                clip = slot.clip
+                clip.looping = True
+                clip.loop_start = 0.0
+                clip.loop_end = length
+                slot.fire()
+                self._log(
+                    "F1 melodic: created + fired clip track %d scene %d (%.2f beats)"
+                    % (
+                        self.track_index_for(0) + 1,
+                        self._resolve_scene_index(0, scene_index) + 1,
+                        length,
+                    )
+                )
+            except (RuntimeError, AttributeError) as exc:
+                self._log("F1 melodic: create_clip failed: %s" % exc)
+                return None
+        clip = slot.clip
+        return clip if clip.is_midi_clip else None
+
+    def melodic_length_steps(self, scene_index=None):
+        clip = self.get_clip(0, scene_index)
+        if clip is None:
+            return None
+        steps = int(round(float(clip.loop_end) / Config.STEP_DURATION_BEATS))
+        return max(
+            Config.MELODIC_LENGTH_MIN_STEPS,
+            min(Config.MELODIC_LENGTH_MAX_STEPS, steps),
+        )
+
+    def set_melodic_length(self, length_steps, scene_index=None):
+        clip = self.ensure_melodic_clip(length_steps, scene_index)
+        if clip is None:
+            return False
+        end = self._melodic_length_beats(length_steps)
+        try:
+            clip.looping = True
+        except (RuntimeError, AttributeError):
+            pass
+        self._move_clip_markers(clip, 0.0, end)
+        try:
+            if end >= clip.loop_end:
+                clip.loop_end = end
+                clip.loop_start = 0.0
+            else:
+                clip.loop_start = 0.0
+                clip.loop_end = end
+        except RuntimeError as exc:
+            self._log("F1 melodic: length set failed: %s" % exc)
+            return False
+        self._log("F1 melodic: length -> %d steps (%.2f beats)" % (length_steps, end))
+        return True
+
+    def read_melodic_pattern(self, scene_index=None):
+        """Return (notes_by_step, length_steps) or (None, None) if no clip."""
+        clip = self.get_clip(0, scene_index)
+        if clip is None:
+            return None, None
+
+        length_steps = self.melodic_length_steps(scene_index) or Config.MELODIC_DEFAULT_LENGTH
+        span = Config.MELODIC_MAX_STEPS * Config.STEP_DURATION_BEATS
+        notes_by_step = {}
+        for note in clip.get_notes_extended(0, 128, 0.0, span):
+            step = int(round(float(note.start_time) / Config.STEP_DURATION_BEATS))
+            if not (0 <= step < Config.MELODIC_MAX_STEPS):
+                continue
+            release = int(getattr(note, "release_velocity", Config.MELODIC_DEFAULT_RELEASE))
+            notes_by_step[step] = (
+                int(note.pitch),
+                int(note.velocity),
+                float(note.duration),
+                release,
+            )
+        return notes_by_step, length_steps
+
+    def write_melodic_pattern(self, state, scene_index=None):
+        clip = self.ensure_melodic_clip(state.mel_length_steps, scene_index)
+        if clip is None:
+            return
+
+        span = Config.MELODIC_MAX_STEPS * Config.STEP_DURATION_BEATS
+        clip.remove_notes_extended(0, 128, 0.0, span)
+
+        specs = []
+        for step in range(Config.MELODIC_MAX_STEPS):
+            if not state.mel_active[step]:
+                continue
+            if step >= state.mel_length_steps:
+                continue
+            specs.append(
+                self._melodic_note_spec(
+                    pitch=state.mel_effective_pitch(step),
+                    start_time=step * Config.STEP_DURATION_BEATS,
+                    duration=max(0.01, float(state.mel_length[step])),
+                    velocity=int(state.mel_velocity[step]),
+                    release=int(state.mel_release[step]),
+                )
+            )
+        if specs:
+            clip.add_new_notes(tuple(specs))
+        self._log(
+            "F1 melodic: wrote %d notes (track %d, scene %s, len %d steps)"
+            % (
+                len(specs),
+                self.track_index_for(0) + 1,
+                self._resolve_scene_index(0, scene_index),
+                state.mel_length_steps,
+            )
+        )
+
+    @staticmethod
+    def _melodic_note_spec(pitch, start_time, duration, velocity, release):
+        kwargs = dict(
+            pitch=pitch,
+            start_time=start_time,
+            duration=duration,
+            velocity=velocity,
+            mute=False,
+        )
+        try:
+            return Live.Clip.MidiNoteSpecification(release_velocity=release, **kwargs)
+        except (TypeError, AttributeError):
+            return Live.Clip.MidiNoteSpecification(**kwargs)
+
+    def clear_melodic(self, scene_index=None):
+        clip = self.get_clip(0, scene_index)
+        if clip is None:
+            return
+        span = Config.MELODIC_MAX_STEPS * Config.STEP_DURATION_BEATS
+        clip.remove_notes_extended(0, 128, 0.0, span)
+
+    def melodic_playing_step(self, scene_index=None):
+        clip = self.get_playing_clip(0)
+        if clip is None or not clip.is_playing:
+            return -1
+        position = clip.playing_position - clip.loop_start
+        step = int(position / Config.STEP_DURATION_BEATS)
+        if 0 <= step < Config.MELODIC_MAX_STEPS:
+            return step
+        return -1
 
     def copy_row_from_scene(self, from_scene, to_scene):
         """Copy each channel's loop window pattern from one scene row to another."""

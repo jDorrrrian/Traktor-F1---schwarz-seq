@@ -99,7 +99,7 @@
           <off>1</off>
           <on>127</on>
           <wrap>on</wrap>
-          <behavior onIfDown="on">increment</behavior>
+          <behavior>gate</behavior>
           <reaction>ondown</reaction>
         </button>
         <button version="1" id="Mute2">
@@ -108,7 +108,7 @@
           <off>1</off>
           <on>127</on>
           <wrap>on</wrap>
-          <behavior onIfDown="on">increment</behavior>
+          <behavior>gate</behavior>
           <reaction>ondown</reaction>
         </button>
         <button version="1" id="Mute3">
@@ -117,7 +117,7 @@
           <off>1</off>
           <on>127</on>
           <wrap>on</wrap>
-          <behavior onIfDown="on">increment</behavior>
+          <behavior>gate</behavior>
           <reaction>ondown</reaction>
         </button>
         <button version="1" id="Mute4">
@@ -126,7 +126,7 @@
           <off>1</off>
           <on>127</on>
           <wrap>on</wrap>
-          <behavior onIfDown="on">increment</behavior>
+          <behavior>gate</behavior>
           <reaction>ondown</reaction>
         </button>
         <button version="1" id="PadA1">

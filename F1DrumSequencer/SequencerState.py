@@ -19,6 +19,23 @@ class SequencerState(object):
         self.finger_drum_bank = 0
         self.finger_drum_lit_pad = -1
 
+        # ---- melodic sequencer state ----
+        n = Config.MELODIC_MAX_STEPS
+        self.mel_active = [False] * n
+        self.mel_note = [Config.MELODIC_DEFAULT_PITCH] * n
+        self.mel_octave = [Config.MELODIC_DEFAULT_OCTAVE] * n
+        self.mel_velocity = [Config.MELODIC_DEFAULT_VELOCITY] * n
+        self.mel_length = [Config.STEP_DURATION_BEATS * 0.9] * n
+        self.mel_release = [Config.MELODIC_DEFAULT_RELEASE] * n
+        self.mel_length_steps = Config.MELODIC_DEFAULT_LENGTH
+        self.mel_page = 0
+        self.mel_held_pads = set()
+        self.mel_tentative = {}
+        self.mel_last_step = 0
+        self.mel_play_step = -1
+        self.mel_key = 0
+        self.mel_scale_type = 0
+
     def load_pattern(self, steps, accents, pitch):
         self.steps = list(steps)
         self.accents = list(accents)
@@ -95,6 +112,150 @@ class SequencerState(object):
         if pad_index == self.finger_drum_lit_pad:
             return Config.LED_PLAYHEAD_ACTIVE
         return Config.LED_ACTIVE
+
+    # ------------------------------------------------------------ melodic
+    def mel_page_count(self):
+        steps = max(1, self.mel_length_steps)
+        pages = (steps + Config.MELODIC_STEPS_PER_PAGE - 1) // Config.MELODIC_STEPS_PER_PAGE
+        return max(1, min(Config.MELODIC_MAX_PAGES, pages))
+
+    def mel_global_step(self, pad):
+        return self.mel_page * Config.MELODIC_STEPS_PER_PAGE + pad
+
+    def mel_step_in_range(self, step):
+        return 0 <= step < self.mel_length_steps
+
+    def mel_effective_pitch(self, step):
+        pitch = self.mel_note[step] + 12 * self.mel_octave[step]
+        return max(0, min(127, pitch))
+
+    def mel_toggle_step(self, step):
+        self.mel_active[step] = not self.mel_active[step]
+        return self.mel_active[step]
+
+    def mel_target_steps(self):
+        """Steps that faders / encoder should edit: held pads, else last step."""
+        if self.mel_held_pads:
+            return sorted(self.mel_held_pads)
+        if 0 <= self.mel_last_step < Config.MELODIC_MAX_STEPS:
+            return [self.mel_last_step]
+        return []
+
+    def mel_change_pitch(self, step, direction):
+        self.mel_note[step] = max(0, min(127, self.mel_note[step] + direction))
+
+    def mel_set_octave_from_fader(self, step, value):
+        span = Config.MELODIC_OCTAVE_MAX - Config.MELODIC_OCTAVE_MIN
+        self.mel_octave[step] = Config.MELODIC_OCTAVE_MIN + int(round(value / 127.0 * span))
+
+    def mel_set_velocity_from_fader(self, step, value):
+        self.mel_velocity[step] = max(1, min(127, value))
+
+    def mel_set_length_from_fader(self, step, value):
+        lo = Config.MELODIC_LENGTH_MIN_BEATS
+        hi = Config.MELODIC_LENGTH_MAX_BEATS
+        self.mel_length[step] = lo + (value / 127.0) * (hi - lo)
+
+    def mel_set_release_from_fader(self, step, value):
+        self.mel_release[step] = max(0, min(127, value))
+
+    def mel_change_length_steps(self, direction):
+        self.mel_length_steps = max(
+            Config.MELODIC_LENGTH_MIN_STEPS,
+            min(Config.MELODIC_LENGTH_MAX_STEPS, self.mel_length_steps + direction),
+        )
+        if self.mel_page >= self.mel_page_count():
+            self.mel_page = self.mel_page_count() - 1
+        return self.mel_length_steps
+
+    def mel_change_key(self, direction):
+        self.mel_key = (self.mel_key + direction) % Config.MELODIC_KEY_COUNT
+        return self.mel_key
+
+    def mel_change_scale_type(self, direction):
+        self.mel_scale_type = (
+            self.mel_scale_type + direction
+        ) % Config.MELODIC_SCALE_TYPE_COUNT
+        return self.mel_scale_type
+
+    def mel_select_page(self, page):
+        if 0 <= page < Config.MELODIC_MAX_PAGES:
+            self.mel_page = page
+            return True
+        return False
+
+    def mel_extend_length_for(self, step):
+        """Grow the sequence length (snapped to a page) to include step."""
+        if step < self.mel_length_steps:
+            return False
+        page = step // Config.MELODIC_STEPS_PER_PAGE
+        new_len = min(
+            Config.MELODIC_MAX_STEPS,
+            (page + 1) * Config.MELODIC_STEPS_PER_PAGE,
+        )
+        if new_len == self.mel_length_steps:
+            return False
+        self.mel_length_steps = new_len
+        return True
+
+    def mel_reset_step(self, step):
+        self.mel_note[step] = Config.MELODIC_DEFAULT_PITCH
+        self.mel_octave[step] = Config.MELODIC_DEFAULT_OCTAVE
+        self.mel_velocity[step] = Config.MELODIC_DEFAULT_VELOCITY
+        self.mel_length[step] = Config.STEP_DURATION_BEATS * 0.9
+        self.mel_release[step] = Config.MELODIC_DEFAULT_RELEASE
+
+    def mel_clear(self):
+        n = Config.MELODIC_MAX_STEPS
+        self.mel_active = [False] * n
+        self.mel_note = [Config.MELODIC_DEFAULT_PITCH] * n
+        self.mel_octave = [Config.MELODIC_DEFAULT_OCTAVE] * n
+        self.mel_velocity = [Config.MELODIC_DEFAULT_VELOCITY] * n
+        self.mel_length = [Config.STEP_DURATION_BEATS * 0.9] * n
+        self.mel_release = [Config.MELODIC_DEFAULT_RELEASE] * n
+        self.mel_tentative = {}
+
+    def mel_load(self, notes_by_step, length_steps):
+        """notes_by_step: dict step -> (pitch, velocity, duration, release)."""
+        self.mel_clear()
+        if length_steps:
+            self.mel_length_steps = max(
+                Config.MELODIC_LENGTH_MIN_STEPS,
+                min(Config.MELODIC_LENGTH_MAX_STEPS, length_steps),
+            )
+        for step, (pitch, velocity, duration, release) in notes_by_step.items():
+            if not (0 <= step < Config.MELODIC_MAX_STEPS):
+                continue
+            self.mel_active[step] = True
+            self.mel_note[step] = max(0, min(127, int(pitch)))
+            self.mel_octave[step] = 0
+            self.mel_velocity[step] = max(1, min(127, int(velocity)))
+            self.mel_length[step] = float(duration)
+            self.mel_release[step] = max(0, min(127, int(release)))
+        if self.mel_page >= self.mel_page_count():
+            self.mel_page = self.mel_page_count() - 1
+
+    def mel_pad_led_hsb(self, pad, hue):
+        step = self.mel_global_step(pad)
+        active = self.mel_active[step]
+        is_playhead = step == self.mel_play_step
+        in_range = self.mel_step_in_range(step)
+        is_held = step in self.mel_held_pads
+
+        if is_held:
+            return (hue, Config.LED_SATURATION, Config.LED_PLAYHEAD_ACTIVE)
+        if active:
+            brightness = (
+                Config.LED_PLAYHEAD_ACTIVE if is_playhead else Config.LED_ACTIVE
+            )
+        elif is_playhead:
+            brightness = Config.LED_PLAYHEAD_EMPTY
+        elif in_range:
+            # Faintly mark steps that belong to the current sequence length.
+            brightness = Config.LED_PLAYHEAD_EMPTY // 2
+        else:
+            brightness = Config.LED_OFF
+        return (hue, Config.LED_SATURATION, brightness)
 
     def step_is_active(self, step_index):
         return self.steps[step_index]

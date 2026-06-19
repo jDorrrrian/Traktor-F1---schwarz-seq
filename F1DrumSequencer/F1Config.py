@@ -32,16 +32,18 @@ DEVICE_MODES = (
     {"label": "MIDI map (passthrough)", "mode": "passthrough"},
     {"label": "Clip launch (APC)", "mode": "clip_launch", "first_track_index": 0},
     {"label": "Finger drum (MPC)", "mode": "finger_drum"},
+    {"label": "Melodic sequencer", "mode": "melodic", "first_track_index": 0},
 )
 NUM_DEVICE_MODES = len(DEVICE_MODES)
 MODE_PASSTHROUGH_INDEX = 2
 MODE_CLIP_LAUNCH_INDEX = 3
 MODE_FINGER_DRUM_INDEX = 4
+MODE_MELODIC_INDEX = 5
 
 # 7-segment display (Basic page): CC 2 on wire channel 12 (Controller Editor ch 13).
 SEGMENT_DISPLAY_CHANNEL = 12
 SEGMENT_DISPLAY_CC = 2
-MODE_DISPLAY_VALUES = (1, 2, 3, 4, 5)
+MODE_DISPLAY_VALUES = (1, 2, 3, 4, 5, 6)
 
 # ---------------------------------------------------------------- inputs
 
@@ -58,24 +60,33 @@ ENCODER_PUSH_CC = 106
 
 # Function buttons on the Basic page (gate) — channel 11 on the wire.
 # Shift-page fallbacks on channel 12 use different CC numbers (see below).
+#
+# On the user's AbletonKontrolF1Up2 template the physical top buttons report:
+#   Sync=51  Quant=52  Capture=53  Reverse=54  Type=55  Size=56  Browse=57
+# Those match the channel-12 fallback set below. Quant is added so the melodic
+# sequencer can use Quant+encoder to send a "key" CC. If your unit reports a
+# different CC, enable DEBUG_FUNCTION_MIDI and update QUANT_CC.
 FUNCTION_CHANNELS = (11, 12)
 FUNCTION_CHANNEL = 11
 CLEAR_CC = 56
 TYPE_CC = 57
 SIZE_CC = 58
 BROWSE_CC = 59
-FUNCTION_CCS = (CLEAR_CC, TYPE_CC, SIZE_CC, BROWSE_CC)
+QUANT_CC = 52
+FUNCTION_CCS = (CLEAR_CC, TYPE_CC, SIZE_CC, BROWSE_CC, QUANT_CC)
 FUNCTION_ROLE_BY_CC = {
     CLEAR_CC: "clear",
     TYPE_CC: "type",
     SIZE_CC: "size",
     BROWSE_CC: "browse",
+    QUANT_CC: "quant",
 }
 FUNCTION_BUTTON_FALLBACKS = (
     ((12, 54), "clear"),
     ((12, 55), "type"),
     ((12, 56), "size"),
     ((12, 57), "browse"),
+    ((12, 52), "quant"),
 )
 
 # Filter pots (absolute 0..127): pot k scrubs channel k's loop window.
@@ -84,6 +95,11 @@ POT_CCS = (2, 3, 4, 5)
 
 FADERS = ((11, 0), (7, 7), (8, 7), (7, 8))
 FADER_FALLBACKS = (((10, 0), 0), ((6, 7), 1), ((6, 8), 3))
+
+# Channel/page buttons (CC 60-63): while held, the encoder remaps the track that
+# button controls (+/- one track per tick). Best with the buttons in Gate mode so
+# the hold ends on release. In Increment mode (press only) the button latches the
+# hold on; press it again to release.
 
 # Live's volume parameter: 1.0 = +6 dB; ~0.85 = unity (0 dB).
 VOLUME_0DB_NORM = 0.85
@@ -109,6 +125,48 @@ FINGER_DRUM_NOTE_OFF_TICKS = 2
 # Clip-launch grid: 4 track columns x 4 scene rows (16 pads).
 CLIP_LAUNCH_TRACKS = NUM_CHANNELS
 CLIP_LAUNCH_SCENE_ROWS = 4
+
+# ---------------------------------------------------------------- melodic sequencer
+#
+# A single-track melodic step sequencer. The 16 pads edit one "page" of steps;
+# the four bottom buttons (CC 60-63) select page 1-4 for up to MELODIC_MAX_STEPS.
+# Notes are written chromatically into the clip — put an Ableton Scale device on
+# the track and the F1 only ever has to move notes by semitone.
+MELODIC_STEPS_PER_PAGE = NUM_STEPS  # 16
+MELODIC_MAX_PAGES = 4
+MELODIC_MAX_STEPS = MELODIC_STEPS_PER_PAGE * MELODIC_MAX_PAGES  # 64
+
+# Track this mode edits (0-indexed). Change to taste.
+MELODIC_FIRST_TRACK_INDEX = 0
+
+# Per-step defaults.
+MELODIC_DEFAULT_LENGTH = MELODIC_STEPS_PER_PAGE  # active step count of a fresh seq
+MELODIC_DEFAULT_PITCH = 60                        # C3 before the Scale device snaps
+MELODIC_DEFAULT_VELOCITY = 100
+MELODIC_DEFAULT_OCTAVE = 0
+MELODIC_DEFAULT_RELEASE = 64
+
+# Fader -> per-step ranges (fader value is 0..127).
+MELODIC_OCTAVE_MIN = -2
+MELODIC_OCTAVE_MAX = 2
+MELODIC_LENGTH_MIN_BEATS = 0.05
+MELODIC_LENGTH_MAX_BEATS = STEP_DURATION_BEATS * MELODIC_STEPS_PER_PAGE  # up to 1 bar
+
+# Sequence-length editing (Size + encoder), in steps.
+MELODIC_LENGTH_MIN_STEPS = 1
+MELODIC_LENGTH_MAX_STEPS = MELODIC_MAX_STEPS
+
+# Key (Quant + encoder) and scale type (Type + encoder) are emitted as CCs that
+# you MIDI-map in Live (e.g. to a Scale device's Root / Scale). Values are spread
+# across 0..127 so a mapped discrete parameter steps through every option.
+MELODIC_OUT_CHANNEL = 5
+MELODIC_KEY_CC = 20
+MELODIC_SCALE_TYPE_CC = 21
+MELODIC_KEY_COUNT = 12
+MELODIC_SCALE_TYPE_COUNT = 16
+
+# Melodic pad color (HSB hue) and the page-button hue for the selected page.
+MELODIC_HUE = 60
 
 NOTE_VELOCITY = 100
 ACCENT_VELOCITY = 127
