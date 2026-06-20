@@ -4,6 +4,8 @@
 
 from __future__ import absolute_import, print_function, unicode_literals
 
+import contextlib
+
 from _Framework.ButtonElement import ButtonElement
 from _Framework.ControlSurface import ControlSurface
 from _Framework.InputControlElement import MIDI_CC_TYPE
@@ -41,6 +43,10 @@ class F1DrumSequencer(ControlSurface):
         self._device_mode = 0
         self._clip_launch_row_offset = 0
         self._last_active_scene = [None] * Config.NUM_CHANNELS
+        # Clip we currently watch for external (Ableton) note edits, plus a guard
+        # so our own writes don't bounce back through the listener.
+        self._observed_clip = None
+        self._suppress_clip_reload = False
 
         self._suggested_input_port = "Traktor Kontrol F1"
         self._suggested_output_port = "Traktor Kontrol F1"
@@ -72,6 +78,8 @@ class F1DrumSequencer(ControlSurface):
             song.remove_is_playing_listener(self._on_is_playing)
         if song.view.selected_scene_has_listener(self._on_selected_scene):
             song.view.remove_selected_scene_listener(self._on_selected_scene)
+
+        self._detach_clip_observer()
 
         self._all_leds_off()
         self._suppress_send_midi = True
@@ -150,10 +158,6 @@ class F1DrumSequencer(ControlSurface):
             self._sequencer.reset_finger_drum_bank()
             self._refresh_all_leds(force=True)
         elif mode.get("mode") == "melodic":
-            self._clip_writer.reset_channel_track_offsets()
-            self._clip_writer.set_first_track_index(
-                mode.get("first_track_index", Config.MELODIC_FIRST_TRACK_INDEX)
-            )
             if self._clip_writer.working_scene_index() is None:
                 self._clip_writer.set_working_scene_index(
                     self._clip_writer.scene_index()
@@ -162,6 +166,8 @@ class F1DrumSequencer(ControlSurface):
             self._sequencer.mel_play_step = -1
             self._reload_melodic_grid()
             self._refresh_all_leds(force=True)
+
+        self._update_clip_observer()
 
         label = mode["label"]
         try:
@@ -205,6 +211,63 @@ class F1DrumSequencer(ControlSurface):
             self._c_instance.send_midi(midi_bytes, False)
         except TypeError:
             self._c_instance.send_midi(midi_bytes)
+
+    # ------------------------------------------------------ clip observation
+
+    def _target_clip(self):
+        """The clip the grid currently mirrors, or None for non-editing modes."""
+        if self._is_melodic_mode():
+            return self._clip_writer.melodic_get_clip()
+        if self._is_sequencer_mode():
+            return self._clip_writer.get_clip(self._sequencer.selected_channel)
+        return None
+
+    def _detach_clip_observer(self):
+        clip = self._observed_clip
+        self._observed_clip = None
+        if clip is None:
+            return
+        try:
+            if clip.notes_has_listener(self._on_observed_clip_notes_changed):
+                clip.remove_notes_listener(self._on_observed_clip_notes_changed)
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _update_clip_observer(self):
+        """Watch the active clip so external (Ableton) note edits sync back."""
+        target = self._target_clip()
+        if target is self._observed_clip:
+            return
+        self._detach_clip_observer()
+        if target is None:
+            return
+        try:
+            target.add_notes_listener(self._on_observed_clip_notes_changed)
+            self._observed_clip = target
+        except (RuntimeError, AttributeError):
+            self._observed_clip = None
+
+    @contextlib.contextmanager
+    def _writing_clip(self):
+        """Suppress the note listener while we write our own notes."""
+        previous = self._suppress_clip_reload
+        self._suppress_clip_reload = True
+        try:
+            yield
+        finally:
+            self._suppress_clip_reload = previous
+
+    def _on_observed_clip_notes_changed(self):
+        """An external edit changed the watched clip: re-read state and LEDs."""
+        if self._suppress_clip_reload:
+            return
+        if self._is_melodic_mode():
+            self._reload_melodic_grid()
+        elif self._is_sequencer_mode():
+            self._reload_grid()
+        else:
+            return
+        self._refresh_all_leds(force=True)
 
     def _function_button_role(self, channel, cc):
         """Return 'clear', 'type', 'size', 'browse', or None."""
@@ -456,12 +519,13 @@ class F1DrumSequencer(ControlSurface):
 
     def _write_selected_channel(self):
         channel = self._sequencer.selected_channel
-        self._clip_writer.write_pattern(
-            channel,
-            self._sequencer.steps,
-            self._sequencer.accents,
-            self._sequencer.current_pitch(),
-        )
+        with self._writing_clip():
+            self._clip_writer.write_pattern(
+                channel,
+                self._sequencer.steps,
+                self._sequencer.accents,
+                self._sequencer.current_pitch(),
+            )
 
     def _on_pad_press(self, step):
         if self._is_clip_launch_mode():
@@ -576,9 +640,13 @@ class F1DrumSequencer(ControlSurface):
         if self._is_function_button_cc(channel, cc):
             return False
 
-        # Filter pots: forward to Live so the user can MIDI-map them.
+        # Filter pots: emit clean, fixed CCs into Live (one per pot) so they can be
+        # MIDI-mapped, e.g. to a filter cutoff on the sequencer's instrument.
         if channel in Config.POT_CHANNELS and cc in Config.POT_CCS:
-            self._forward_to_live((0xB0 | (channel & 0x0F), cc, value))
+            pot = Config.POT_CCS.index(cc)
+            self._forward_cc(
+                Config.MELODIC_POT_OUT_CHANNEL, Config.MELODIC_POT_CCS[pot], value
+            )
             return True
 
         fader_index = self._fader_map.get((channel, cc))
@@ -708,11 +776,15 @@ class F1DrumSequencer(ControlSurface):
         self._write_melodic()
         self._refresh_all_leds()
 
+    def _forward_cc(self, channel, cc, value):
+        """Send a CC into Live's mapping layer (for the user to MIDI-map)."""
+        self._forward_to_live((0xB0 | (channel & 0x0F), cc, max(0, min(127, int(value)))))
+
     def _send_melodic_key(self):
         value = int(round(
             self._sequencer.mel_key * 127.0 / max(1, Config.MELODIC_KEY_COUNT - 1)
         ))
-        self._send_cc(Config.MELODIC_OUT_CHANNEL, Config.MELODIC_KEY_CC, value, force=True)
+        self._forward_cc(Config.MELODIC_OUT_CHANNEL, Config.MELODIC_KEY_CC, value)
 
     def _send_melodic_scale_type(self):
         value = int(round(
@@ -720,25 +792,29 @@ class F1DrumSequencer(ControlSurface):
             * 127.0
             / max(1, Config.MELODIC_SCALE_TYPE_COUNT - 1)
         ))
-        self._send_cc(
-            Config.MELODIC_OUT_CHANNEL, Config.MELODIC_SCALE_TYPE_CC, value, force=True
+        self._forward_cc(
+            Config.MELODIC_OUT_CHANNEL, Config.MELODIC_SCALE_TYPE_CC, value
         )
 
     def _write_melodic(self):
-        self._clip_writer.write_melodic_pattern(self._sequencer)
+        with self._writing_clip():
+            self._clip_writer.write_melodic_pattern(self._sequencer)
 
     def _reload_melodic_grid(self):
         notes_by_step, length_steps = self._clip_writer.read_melodic_pattern()
         if notes_by_step is None:
+            self._update_clip_observer()
             return
         self._sequencer.mel_load(notes_by_step, length_steps)
+        self._update_clip_observer()
 
     def _transpose_selected_channel_sound(self, old_pitch, new_pitch):
         delta = new_pitch - old_pitch
         if delta == 0:
             return
         channel = self._sequencer.selected_channel
-        self._clip_writer.transpose_clip(channel, delta)
+        with self._writing_clip():
+            self._clip_writer.transpose_clip(channel, delta)
 
     def _on_channel_button(self, channel, value):
         """Press selects (drum) / selects page (melodic); while a button is held the
@@ -774,10 +850,10 @@ class F1DrumSequencer(ControlSurface):
         )
 
     def _remap_melodic_track(self, direction):
-        self._clip_writer.set_channel_track_offset(
-            0, self._clip_writer.channel_track_offset(0) + direction
+        self._clip_writer.set_melodic_track_index(
+            self._clip_writer.melodic_track_index() + direction
         )
-        track_no = self._clip_writer.track_index_for(0) + 1
+        track_no = self._clip_writer.melodic_track_index() + 1
         self._reload_melodic_grid()
         self._refresh_all_leds(force=True)
         self._send_segment(track_no, force=True)
@@ -898,7 +974,8 @@ class F1DrumSequencer(ControlSurface):
         if self._is_melodic_mode():
             self._sequencer.mel_clear()
             self._sequencer.mel_held_pads.clear()
-            self._clip_writer.clear_melodic()
+            with self._writing_clip():
+                self._clip_writer.clear_melodic()
             self._refresh_all_leds(force=True)
             self.log_message("F1 melodic cleared")
             return
@@ -908,7 +985,8 @@ class F1DrumSequencer(ControlSurface):
 
         channel = self._sequencer.selected_channel
         self._sequencer.clear_pattern()
-        self._clip_writer.clear_loop_window(channel)
+        with self._writing_clip():
+            self._clip_writer.clear_loop_window(channel)
         self._refresh_all_leds(force=True)
         self.log_message(
             "F1 cleared loop ch=%d win=%d scene=%d"
@@ -1058,6 +1136,7 @@ class F1DrumSequencer(ControlSurface):
         self._sequencer.load_pattern(steps, accents, pitch)
         # Switching to/loading another clip updates the sound-number display.
         self._show_sound_number()
+        self._update_clip_observer()
 
     # ------------------------------------------------------------ LEDs
 

@@ -32,7 +32,7 @@ DEVICE_MODES = (
     {"label": "MIDI map (passthrough)", "mode": "passthrough"},
     {"label": "Clip launch (APC)", "mode": "clip_launch", "first_track_index": 0},
     {"label": "Finger drum (MPC)", "mode": "finger_drum"},
-    {"label": "Melodic sequencer", "mode": "melodic", "first_track_index": 0},
+    {"label": "Melodic sequencer", "mode": "melodic"},
 )
 NUM_DEVICE_MODES = len(DEVICE_MODES)
 MODE_PASSTHROUGH_INDEX = 2
@@ -136,8 +136,10 @@ MELODIC_STEPS_PER_PAGE = NUM_STEPS  # 16
 MELODIC_MAX_PAGES = 4
 MELODIC_MAX_STEPS = MELODIC_STEPS_PER_PAGE * MELODIC_MAX_PAGES  # 64
 
-# Track this mode edits (0-indexed). Change to taste.
-MELODIC_FIRST_TRACK_INDEX = 0
+# Dedicated track for the melodic sequencer (0-indexed). This is fully separate
+# from the drum channels — set it to whichever track holds your scale instrument.
+# You can also retarget it live: hold a bottom button and turn the encoder.
+MELODIC_FIRST_TRACK_INDEX = 8
 
 # Per-step defaults.
 MELODIC_DEFAULT_LENGTH = MELODIC_STEPS_PER_PAGE  # active step count of a fresh seq
@@ -164,6 +166,12 @@ MELODIC_KEY_CC = 20
 MELODIC_SCALE_TYPE_CC = 21
 MELODIC_KEY_COUNT = 12
 MELODIC_SCALE_TYPE_COUNT = 16
+
+# In melodic mode the four filter pots emit these CCs (one per pot) into Live so
+# you can MIDI-map them (e.g. to a filter cutoff). In the drum modes the pots keep
+# scrubbing the loop window as before.
+MELODIC_POT_OUT_CHANNEL = 5
+MELODIC_POT_CCS = (22, 23, 24, 25)
 
 # Melodic pad color (HSB hue) and the page-button hue for the selected page.
 MELODIC_HUE = 60

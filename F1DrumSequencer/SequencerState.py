@@ -216,8 +216,16 @@ class SequencerState(object):
         self.mel_tentative = {}
 
     def mel_load(self, notes_by_step, length_steps):
-        """notes_by_step: dict step -> (pitch, velocity, duration, release)."""
-        self.mel_clear()
+        """notes_by_step: dict step -> (pitch, velocity, duration, release).
+
+        Only the active flags are reset; per-step pitch/octave/velocity/length/
+        release are *preserved* for steps absent from the clip. This keeps a
+        step's note when it is removed and re-added (e.g. tapping a pad off then
+        on to select it) instead of snapping it back to the default pitch.
+        """
+        n = Config.MELODIC_MAX_STEPS
+        self.mel_active = [False] * n
+        self.mel_tentative = {}
         if length_steps:
             self.mel_length_steps = max(
                 Config.MELODIC_LENGTH_MIN_STEPS,

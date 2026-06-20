@@ -208,7 +208,7 @@ The **7-segment display** next to the encoder shows the mode number (**1**–**6
 
 ## Melodic sequencer mode
 
-Mode 6 turns the F1 into a melodic step sequencer for **one** track (set by `MELODIC_FIRST_TRACK_INDEX`, default track 1). It writes one note per active step into the track's clip in the selected scene, exactly like the drum modes write patterns — but each step has its own pitch and per-note parameters.
+Mode 6 turns the F1 into a melodic step sequencer for **one dedicated track**, fully independent of the drum channels. The track is set by `MELODIC_FIRST_TRACK_INDEX` (default track 9) — point it at whichever track holds your scale instrument — and you can also retarget it live by **holding a bottom button and turning the encoder**. It writes one note per active step into the track's clip in the selected scene, exactly like the drum modes write patterns — but each step has its own pitch and per-note parameters.
 
 It assumes you put an **Ableton Scale device** (or any scale-quantizing instrument) on the track. The F1 only ever moves notes **chromatically by semitone**; the Scale device keeps everything in key.
 
@@ -227,7 +227,7 @@ It assumes you put an **Ableton Scale device** (or any scale-quantizing instrume
 | **Quant + encoder** | Key — sends CC on `MELODIC_OUT_CHANNEL`/`MELODIC_KEY_CC` |
 | **Type + encoder** | Scale type — sends CC on `MELODIC_OUT_CHANNEL`/`MELODIC_SCALE_TYPE_CC` |
 | **Browse + encoder** | Switch device mode (as everywhere) |
-| **Filter pots** | Forwarded to Live so you can MIDI-map them yourself |
+| **Filter pots** | Each pot emits a fixed CC into Live (defaults: channel 6, CC 22–25) — MIDI-map them to anything, e.g. the instrument's filter cutoff. In the drum modes the pots still scrub loop windows. |
 | **Reverse (Clear)** | Clear the whole melodic sequence |
 
 > **Pads must be set to Gate** (send 127 on press, 0 on release) for *hold-to-edit* to work. In NI Controller Editor set the 16 pads' behavior to **Gate**. If your pads only send on press, the faders/encoder will edit the **last** step you tapped instead of the one you're holding.
